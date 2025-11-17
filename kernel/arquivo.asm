@@ -1,6 +1,6 @@
 ; =============================================================
 ;              VentureOS Kernel - Arquivo Único
-;           Desenvolvido para Augusto 😄🔥 sem simulação
+;           Desenvolvido por Augusto
 ; =============================================================
 
 [org 0x7C00]

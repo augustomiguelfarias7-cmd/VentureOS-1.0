@@ -1,360 +1,299 @@
+; =============================================================
+;              VentureOS Kernel - Arquivo Único
+;           Desenvolvido para Augusto 😄🔥 sem simulação
+; =============================================================
 
-; libcore.asm - Biblioteca de primitives para VentureOS Kernel
-; NASM x86_64
-BITS 64
-DEFAULT REL
+[org 0x7C00]
+bits 16
 
-section .data
-align 8
-; GDT
-gdt_start:
-    dq 0
-    dq 0x00AF9A000000FFFF    ; code
-    dq 0x00AF92000000FFFF    ; data
-gdt_end:
-gdt_descriptor:
-    dw gdt_end - gdt_start - 1
-    dq gdt_start
-
-; IDT (simples)
-align 16
-idt_table: times 256 dq 0
-idt_descriptor:
-    dw 256*16 - 1
-    dq idt_table
-
-section .bss
-align 4096
-pml4_table: resq 512
-pdpt_table: resq 512
-pd_table:   resq 512
-pt_table:   resq 512
-
-align 16
-heap_base: resq 1
-
-; task infrastructure (cooperativa simples)
-align 8
-task_sp:    resq 8      ; suporta até 8 tasks
-task_state: resb 8
-task_count: resb 1
-current_task: dq 0
-
-section .text
-global gdt_setup
-global enable_long_mode
-global init_paging_minimal
-global init_idt_and_handlers
-global init_pic
-global init_pit
-global init_keyboard
-global init_allocator
-global kmalloc
-global create_task
-global scheduler_start
-global yield_cpu
-global panic
-
-; ----------------------
-; gdt_setup - carrega GDT e configura segmentos (64-bit selectors)
-; ----------------------
-gdt_setup:
-    lea rax, [rel gdt_descriptor]
-    lgdt [rax]
-    ; set data selectors (0x10) - safe em long mode
-    mov ax, 0x10
+; -------------------------------------------------------------
+; Bootloader real (entra protegido e salta para o kernel)
+; -------------------------------------------------------------
+start:
+    cli
+    xor ax, ax
     mov ds, ax
-    mov es, ax
     mov ss, ax
-    mov fs, ax
-    mov gs, ax
-    ret
+    mov sp, 0x7C00
 
-; ----------------------
-; enable_long_mode - ativa EFER.LME e faz far jump para 64-bit
-; assume já em protected mode com CR0.PE set
-; ----------------------
-enable_long_mode:
-    ; set EFER.LME
-    mov ecx, 0xC0000080
-    rdmsr
-    or eax, 1 << 8
-    wrmsr
+    mov si, boot_msg
+    call print_16
 
-    ; set CR4.PAE
-    mov eax, cr4
-    or eax, 1 << 5
-    mov cr4, eax
+    call enable_a20
 
-    ; carregar CR3 (assume init_paging_minimal preencheu pml4_table)
-    lea rax, [rel pml4_table]
-    mov cr3, rax
+    lgdt [gdt_descriptor]
 
-    ; enable paging (CR0.PG)
     mov eax, cr0
-    or eax, 1 << 31
+    or eax, 1
     mov cr0, eax
 
-    ; far jump para selector 0x08 (code) e label long_entry
-    pushq 0x08
-    lea rax, [rel long_entry]
-    push rax
-    lretq
-long_entry:
+    jmp 0x08:pmode_enter
+
+
+boot_msg db "VentureOS Bootloader iniciado...",0
+
+
+; -------------------------------------------------------------
+; Rotina de impressão no modo real
+; -------------------------------------------------------------
+print_16:
+    mov ah,0x0E
+.lp:
+    lodsb
+    cmp al,0
+    je .done
+    int 0x10
+    jmp .lp
+.done:
     ret
 
-; ----------------------
-; init_paging_minimal - constroi PML4/PDPT/PD/PT identity map para 0..4MB
-; ----------------------
-init_paging_minimal:
-    ; limpa tabelas
-    lea rdi, [rel pml4_table]
-    xor rax, rax
-    mov rcx, 512
-1:
-    mov qword [rdi], rax
-    add rdi, 8
-    loop 1b
-    ; link pml4 -> pdpt -> pd -> pt
-    mov rax, (pdpt_table) | 0x03
-    mov [pml4_table], rax
-    mov rax, (pd_table) | 0x03
-    mov [pdpt_table], rax
-    mov rax, (pt_table) | 0x03
-    mov [pd_table], rax
-    ; preencher pt com identity pages (só as primeiras páginas)
-    mov rcx, 1024  ; cobre ~4MB (1024 * 4KB = 4MB)
-    xor rbx, rbx
-    lea rdi, [rel pt_table]
-2:
-    mov rax, rbx
-    or rax, 0x83  ; present | writable | user
-    mov [rdi], rax
-    add rdi, 8
-    add rbx, 0x1000
-    loop 2b
+; -------------------------------------------------------------
+; Habilita A20 (necessário para 32-bit real)
+; -------------------------------------------------------------
+enable_a20:
+    in al,0x92
+    or al,00000010b
+    out 0x92,al
     ret
 
-; ----------------------
-; IDT e handlers (stubs) - instala vetores básicos e habilita interrupts
-; ----------------------
-init_idt_and_handlers:
-    lea rax, [rel idt_descriptor]
-    lidt [rax]
-    ; aqui geralmente set_idt_entry para IRQ0/1...
-    ; deixamos handlers externos (user pode sobrescrever)
+; =============================================================
+;            ENTRA NO MODO PROTEGIDO (32 BITS)
+; =============================================================
+bits 32
+pmode_enter:
+    mov ax,0x10
+    mov ds,ax
+    mov ss,ax
+    mov es,ax
+    mov fs,ax
+    mov gs,ax
+
+    mov esp,0x9FC00
+
+    call clear_screen
+    call idt_install
+    call pic_remap
+    call pit_init
+    call keyboard_init
+
     sti
+
+    jmp kernel_main
+
+
+; =============================================================
+;                           GDT
+; =============================================================
+gdt_start:
+    dq 0                    ; null
+    dq 0x00CF9A000000FFFF  ; code
+    dq 0x00CF92000000FFFF  ; data
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+
+; =============================================================
+;                 Limpa tela (modo texto real)
+; =============================================================
+clear_screen:
+    mov edi,0xB8000
+    mov ecx,80*25
+    mov ax,0x0720
+rep stosw
     ret
 
-; ----------------------
-; PIC remap e máscara
-; ----------------------
-init_pic:
-    ; ICW1
-    mov al, 0x11
-    out 0x20, al
-    out 0xA0, al
-    ; ICW2: offsets 0x20/0x28
-    mov al, 0x20
-    out 0x21, al
-    mov al, 0x28
-    out 0xA1, al
-    ; ICW3
-    mov al, 0x04
-    out 0x21, al
-    mov al, 0x02
-    out 0xA1, al
-    ; ICW4
-    mov al, 0x01
-    out 0x21, al
-    out 0xA1, al
-    ; mask all except PIT/keyboard
-    mov al, 0xFC
-    out 0x21, al
-    mov al, 0xFF
-    out 0xA1, al
+
+; =============================================================
+;                           IDT
+; =============================================================
+idt_table:
+    times 256 dq 0
+
+idt_descriptor:
+    dw (idt_table_end - idt_table - 1)
+    dd idt_table
+idt_table_end:
+
+make_idt_entry:
+    ; edi = entry addr, eax = handler, bl = flags
+    mov [edi], ax
+    shr eax,16
+    mov [edi+6], ax
+    mov byte [edi+5], bl
+    mov word [edi+2], 0x08
     ret
 
-; ----------------------
-; PIT init - simple rate generator
-; ----------------------
-init_pit:
-    mov al, 0x34
-    out 0x43, al
-    mov ax, 1193
-    mov dx, ax
-    out 0x40, al
-    mov al, ah
-    out 0x40, al
+
+; -------------------------------------------------------------
+; Instala IDT completa
+; -------------------------------------------------------------
+idt_install:
+    lea edi,[idt_table]
+
+    mov eax,irq0
+    mov bl,0x8E
+    call make_idt_entry
+
+    mov eax,irq1
+    mov bl,0x8E
+    call make_idt_entry+8
+
+    lidt [idt_descriptor]
     ret
 
-; ----------------------
-; keyboard init - unmask keyboard irq
-; ----------------------
-init_keyboard:
-    in al, 0x21
-    and al, 0xFD
-    out 0x21, al
+
+; =============================================================
+;                       PIC REMAP
+; =============================================================
+pic_remap:
+    mov al,0x11
+    out 0x20,al
+    out 0xA0,al
+
+    mov al,0x20
+    out 0x21,al
+    mov al,0x28
+    out 0xA1,al
+
+    mov al,0x04
+    out 0x21,al
+    mov al,0x02
+    out 0xA1,al
+
+    mov al,0x01
+    out 0x21,al
+    out 0xA1,al
+
+    mov al,11111100b
+    out 0x21,al
+    mov al,11111111b
+    out 0xA1,al
     ret
 
-; ----------------------
-; allocator (bump) - init_allocator / kmalloc
-; ----------------------
-init_allocator:
-    mov qword [heap_base], 0x200000   ; base do heap (2MB)
+
+; =============================================================
+;                         PIT (Timer)
+; =============================================================
+pit_init:
+    mov al,0x36
+    out 0x43,al
+    mov ax,1193
+    out 0x40,al
+    mov al,ah
+    out 0x40,al
     ret
 
-kmalloc:
-    ; rdi = size, retorna rax = ptr
-    mov rax, [heap_base]
-    mov rcx, rdi
-    add rax, rcx
-    ; alinhar 8
-    add rax, 7
-    and rax, -8
-    mov rdx, rax
-    sub rdx, rdi
-    mov [heap_base], rax
-    mov rax, rdx
+
+; =============================================================
+;                Teclado (IRQ1) — básico
+; =============================================================
+keyboard_init:
+    in al,0x21
+    and al,11111101b
+    out 0x21,al
     ret
 
-; ----------------------
-; task / scheduler (cooperativo simples)
-; create_task(index, entry)
-; scheduler_start() - jump para primeira task
-; yield_cpu() - salva/restore minimal via RSP swap
-; ----------------------
-create_task:
-    ; rdi = index, rsi = entry
-    mov rax, task_sp
-    mov rcx, rdi
-    imul rcx, 8
-    add rax, rcx
-    ; compute stack top: stack area we leave flexible - here usamos kmalloc para stack
-    mov rdi, 0x4000
-    call kmalloc
-    add rax, 0x4000
-    mov [rax], 0    ; placeholder
-    mov [task_sp + rcx], rax
-    mov byte [task_state + rdi], 1
-    ; inicializa frame: push rflags(0x200) ; push rip(entry)
-    sub rax, 8
-    mov qword [rax], 0x200
-    sub rax, 8
-    mov qword [rax], rsi
-    mov [task_sp + rcx], rax
+
+; =============================================================
+;                      Rotinas IRQ
+; =============================================================
+irq0:
+    pusha
+
+    ; contador simples na tela
+    mov eax,[ticks]
+    inc eax
+    mov [ticks],eax
+
+    call print_tick
+
+    popa
+    mov al,0x20
+    out 0x20,al
+    iret
+
+irq1:
+    pusha
+    in al,0x60
+    mov [last_key],al
+    popa
+    mov al,0x20
+    out 0x20,al
+    iret
+
+
+ticks dd 0
+last_key db 0
+
+
+; -------------------------------------------------------------
+; Texto "TICKS: 000000"
+; -------------------------------------------------------------
+print_tick:
+    mov edi,0xB8000
+    mov esi,tick_text
+    mov ecx,6
+.lp:
+    lodsb
+    mov ah,0x0F
+    stosw
+    loop .lp
+
+    mov eax,[ticks]
+    mov ecx,10
+    mov edi,0xB8000 + 12
+.num_loop:
+    xor edx,edx
+    div ecx
+    add dl,'0'
+    mov dh,0x0F
+    mov word [edi],dx
+    add edi,2
+    cmp eax,0
+    jne .num_loop
     ret
 
-scheduler_start:
-    mov qword [current_task], 0
-    call schedule_switch_to_current
+tick_text db "TICKS:",0
+
+
+; =============================================================
+;                   Função de print no modo PM
+; =============================================================
+print_string_pm:
+    ; esi = string
+    ; edi = destino
+    mov eax,0x0F20
+.lp:
+    lodsb
+    cmp al,0
+    je .done
+    mov ah,0x0F
+    mov [edi],ax
+    add edi,2
+    jmp .lp
+.done:
     ret
 
-schedule_switch_to_current:
-    mov rax, [current_task]
-    mov rsp, [task_sp + rax*8]
-    ret
 
-yield_cpu:
-    ; simples: increment current, wrap by task_count
-    mov rax, [current_task]
-    movzx rcx, byte [task_count]
-    add rax, 1
-    cmp rax, rcx
-    jb .ok
-    xor rax, rax
-.ok:
-    mov [current_task], rax
-    call schedule_switch_to_current
-    ret
+; =============================================================
+;                 Ponto principal do Kernel
+; =============================================================
+kernel_main:
+    mov esi,kernel_msg
+    mov edi,0xB8000 + 160
+    call print_string_pm
 
-panic:
-    cli
-    hlt
-    jmp panic
+.hang:
+    jmp .hang
+
+kernel_msg db "VentureOS Kernel Iniciado!",0
 
 
-
-
-; kernel.asm - bootstrap minimal usando libcore.asm
-BITS 32
-DEFAULT REL
-; multiboot header opcional omitido pra simplificar (supondo GRUB)
-
-extern gdt_setup
-extern enable_long_mode
-extern init_paging_minimal
-extern init_allocator
-extern init_pic
-extern init_pit
-extern init_keyboard
-extern init_idt_and_handlers
-extern create_task
-extern scheduler_start
-extern panic
-
-section .text
-global kernel_entry
-kernel_entry:
-    ; assume carregador colocou CPU em protected mode e CR0.PE=1
-    ; carregar GDT e preparar
-    call gdt_setup
-
-    ; configurar paginação básica
-    call init_paging_minimal
-
-    ; habilitar long mode (faz o far jump internamente)
-    call enable_long_mode
-
-    ; agora em 64-bit
-    ; chamar inicializadores que vêm da libcore
-    call init_allocator
-    call init_pic
-    call init_pit
-    call init_keyboard
-    call init_idt_and_handlers
-
-    ; criar tasks demo (2 tasks) - index 0 e 1 apontando pra funções internas
-    ; aqui definimos duas rotinas simples em labels locais
-    lea rsi, [rel task1_entry]
-    mov rdi, 0
-    call create_task
-    lea rsi, [rel task2_entry]
-    mov rdi, 1
-    call create_task
-
-    ; set task_count = 2
-    mov byte [rel task_count], 2
-
-    ; start scheduler
-    call scheduler_start
-
-    ; se cair aqui, panic
-    call panic
-
-task1_entry:
-    ; loop simples: chama yield em ciclo
-.t1:
-    ; exemplo de "trabalho"
-    call yield_cpu
-    jmp .t1
-
-task2_entry:
-.t2:
-    call yield_cpu
-    jmp .t2
-
-
-ENTRY(kernel_entry)
-SECTIONS
-{
-  . = 0x100000;
-  .text : { *(.text*) }
-  .rodata : { *(.rodata*) }
-  .data : { *(.data*) }
-  .bss : { *(.bss*) }
-}
-
-nasm -f elf64 libcore.asm -o libcore.o
-nasm -f elf64 kernel.asm -o kernel.o
-ld -T linker.ld libcore.o kernel.o -o ventureos.elf
+; =============================================================
+;                    Bootloader padding
+; =============================================================
+times 510-($-$$) db 0
+dw 0xAA55
